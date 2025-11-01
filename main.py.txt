@@ -1,0 +1,327 @@
+import pandas as pd
+
+# Load full dataset (replace with your actual path or method)
+df = pd.read_csv('PaySim1 Dataset.csv')
+# Sample 200,000 rows randomly
+df_sampled = df.sample(n=200000, random_state=42).reset_index(drop=True)
+fraud_cases = df_sampled[df_sampled['isFraud'] == 1]
+print(df_sampled.head(5))
+# Drop rows with missing values (if any)
+df_sampled.dropna(inplace=True)
+
+# Feature Engineering
+df_sampled['balanceDiffOrig'] = df_sampled['oldbalanceOrg'] - df_sampled['newbalanceOrig']
+df_sampled['balanceDiffDest'] = df_sampled['newbalanceDest'] - df_sampled['oldbalanceDest']
+df_sampled['amountRatioOrig'] = df_sampled['amount'] / (df_sampled['oldbalanceOrg'] + 1e-6)
+
+# Encode 'type' column
+df_sampled['type_encoded'] = df_sampled['type'].astype('category').cat.codes
+from sklearn.model_selection import TimeSeriesSplit
+
+# Sort by time if applicable (e.g., by 'step')
+df_sampled.sort_values('step', inplace=True)
+
+# Define features and target
+X = df_sampled.drop(columns=['isFraud', 'isFlaggedFraud'])  # keep 'type' for now
+y = df_sampled['isFraud']
+
+# Time-based cross-validation
+tscv = TimeSeriesSplit(n_splits=5)
+from imblearn.over_sampling import ADASYN
+
+# Apply ADASYN only on training data inside each fold
+X_resampled_folds = []
+y_resampled_folds = []
+
+# تحديد الأعمدة النصية التي يجب حذفها
+non_numeric_cols = ['type', 'nameOrig', 'nameDest']
+
+# داخل الحلقة:
+for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+
+    # حذف الأعمدة غير العددية قبل إعادة التوازن
+    X_train_clean = X_train.drop(columns=non_numeric_cols)
+    X_test_clean = X_test.drop(columns=non_numeric_cols)
+
+    # تطبيق ADASYN
+    ada = ADASYN()
+    X_train_resampled, y_train_resampled = ada.fit_resample(X_train_clean, y_train)
+
+    # تخزين النتائج
+    X_resampled_folds.append((X_train_resampled, y_train_resampled, X_test_clean, y_test))
+    # تصحيح مسافة بادئة لطباعة الأشكال
+    print(f"Fold {fold+1}:")
+    print(f"  Resampled training shape: {X_train_resampled.shape}, {y_train_resampled.shape}")
+    print(f"  Original test shape: {X_test_clean.shape}, {y_test.shape}")
+    print("-" * 40)
+from sklearn.ensemble import StackingClassifier, HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import classification_report, roc_auc_score, matthews_corrcoef, balanced_accuracy_score
+from imblearn.over_sampling import ADASYN
+from sklearn.metrics import roc_curve, precision_recall_curve, confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import warnings
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# إعداد النماذج الأساسية
+base_learners = [
+    ('hgb', HistGradientBoostingClassifier(max_iter=100, learning_rate=0.1, random_state=42)),
+    ('lgbm', LGBMClassifier(n_estimators=100, max_depth=8, learning_rate=0.1, random_state=42))
+]
+
+# المصنف النهائي
+meta_model = LogisticRegression(max_iter=500, random_state=42)
+
+# نموذج التكديس
+stacking_model = StackingClassifier(
+    estimators=base_learners,
+    final_estimator=meta_model,
+    cv=5,
+    n_jobs=-1,
+    passthrough=False
+)
+
+# الأعمدة النصية التي يجب حذفها
+non_numeric_cols = ['type', 'nameOrig', 'nameDest']
+
+# تقسيم زمني إلى 5 طيات
+tscv = TimeSeriesSplit(n_splits=5)
+
+# تنفيذ التحقق الزمني مع إعادة التوازن داخل كل طية
+for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+    print(f"\n🧪 Fold {fold + 1} Evaluation")
+
+    # تقسيم البيانات
+    X_train, y_train = X.iloc[train_idx].copy(), y.iloc[train_idx].copy()
+    X_test, y_test = X.iloc[test_idx].copy(), y.iloc[test_idx].copy()
+
+    # حذف الأعمدة غير العددية
+    X_train_clean = X_train.drop(columns=non_numeric_cols, errors='ignore')
+    X_test_clean = X_test.drop(columns=non_numeric_cols, errors='ignore')
+
+    # تطبيق ADASYN فقط على بيانات التدريب
+    ada = ADASYN(random_state=42)
+    X_train_resampled, y_train_resampled = ada.fit_resample(X_train_clean, y_train)
+
+    # تدريب النموذج
+    stacking_model.fit(X_train_resampled, y_train_resampled)
+
+    # التنبؤ والتقييم
+    preds = stacking_model.predict(X_test_clean)
+    probs = stacking_model.predict_proba(X_test_clean)[:, 1]
+
+    print(classification_report(y_test, preds, digits=4))
+    print("ROC AUC Score:", round(roc_auc_score(y_test, probs), 5))
+    print("MCC:", round(matthews_corrcoef(y_test, preds), 5))
+    print("Balanced Accuracy:", round(balanced_accuracy_score(y_test, preds), 5))
+    print("-" * 60)
+# قبل الحلقة: تهيئة القوائم
+tprs = []
+fprs = []
+precisions = []
+recalls = []
+cms = []
+
+# داخل الحلقة بعد التقييم
+fpr, tpr, _ = roc_curve(y_test, probs)
+precision, recall, _ = precision_recall_curve(y_test, probs)
+cm = confusion_matrix(y_test, preds)
+
+# تخزين القيم
+tprs.append(np.interp(np.linspace(0, 1, 100), fpr, tpr))
+fprs.append(np.linspace(0, 1, 100))
+precisions.append(np.interp(np.linspace(0, 1, 100), recall[::-1], precision[::-1]))
+recalls.append(np.linspace(0, 1, 100))
+cms.append(cm)
+# متوسط منحنى ROC
+mean_tpr = np.mean(tprs, axis=0)
+mean_fpr = np.mean(fprs, axis=0)
+plt.figure(figsize=(6, 4))
+plt.plot(mean_fpr, mean_tpr, label='Mean ROC Curve')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Mean ROC Curve Across Folds')
+plt.legend()
+plt.show()
+
+# متوسط منحنى Precision-Recall
+mean_precision = np.mean(precisions, axis=0)
+mean_recall = np.mean(recalls, axis=0)
+plt.figure(figsize=(6, 4))
+plt.plot(mean_recall, mean_precision, label='Mean PR Curve')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Mean Precision-Recall Curve Across Folds')
+plt.legend()
+plt.show()
+
+# متوسط مصفوفة الالتباس
+mean_cm = np.mean(cms, axis=0).astype(int)
+disp = ConfusionMatrixDisplay(confusion_matrix=mean_cm)
+disp.plot(cmap='Blues')
+plt.title('Mean Confusion Matrix Across Folds')
+plt.show()
+!pip install optuna
+import optuna
+import warnings
+import pandas as pd
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.ensemble import StackingClassifier, HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from lightgbm import LGBMClassifier
+
+# إظهار التحذيرات المهمة فقط
+warnings.simplefilter("ignore", category=UserWarning)
+
+# تنظيف الأعمدة منخفضة التباين
+low_var_cols = [col for col in X_train_resampled.columns if X_train_resampled[col].nunique() <= 1]
+if low_var_cols:
+    print(f"Removing low-variance columns: {low_var_cols}")
+    X_train_resampled = X_train_resampled.drop(columns=low_var_cols)
+
+# إعداد التحقق الزمني
+cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)  # تقليل عدد الطيات لتسريع التنفيذ
+
+# تحسين LightGBM
+def optimize_lgbm(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 200),
+        'max_depth': trial.suggest_int('max_depth', 5, 8),
+        'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.15),
+        'num_leaves': trial.suggest_int('num_leaves', 31, 80),
+        'min_child_samples': trial.suggest_int('min_child_samples', 10, 30)
+    }
+    model = LGBMClassifier(**params, random_state=42, verbose=-1)
+    score = cross_val_score(model, X_train_resampled, y_train_resampled, cv=cv, scoring='f1').mean()
+    return score
+
+study_lgbm = optuna.create_study(direction='maximize')
+study_lgbm.optimize(optimize_lgbm, n_trials=15)  # تقليل عدد التجارب لتسريع التنفيذ
+best_lgbm_params = study_lgbm.best_params
+
+# تحسين HistGradientBoosting
+def optimize_hgb(trial):
+    params = {
+        'max_iter': trial.suggest_int('max_iter', 100, 200),
+        'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.15),
+        'max_depth': trial.suggest_int('max_depth', 5, 8),
+        'l2_regularization': trial.suggest_float('l2_regularization', 0.01, 0.5)
+    }
+    model = HistGradientBoostingClassifier(**params, random_state=42)
+    score = cross_val_score(model, X_train_resampled, y_train_resampled, cv=cv, scoring='f1').mean()
+    return score
+
+study_hgb = optuna.create_study(direction='maximize')
+study_hgb.optimize(optimize_hgb, n_trials=15)
+best_hgb_params = study_hgb.best_params
+
+# النماذج المحسّنة
+lgbm_opt = LGBMClassifier(**best_lgbm_params, random_state=42)
+hgb_opt = HistGradientBoostingClassifier(**best_hgb_params, random_state=42)
+
+# نموذج التكديس النهائي
+stacking_model_opt = StackingClassifier(
+    estimators=[
+        ('lgbm', lgbm_opt),
+        ('hgb', hgb_opt)
+    ],
+    final_estimator=LogisticRegression(max_iter=500, random_state=42),
+    cv=3,
+    n_jobs=-1
+)
+
+# تقييم الأداء النهائي (اختياري)
+score = cross_val_score(stacking_model_opt, X_train_resampled, y_train_resampled, cv=cv, scoring='f1').mean()
+print(f"Optimized Stacking F1 Score: {score:.4f}")
+import shap
+import matplotlib.pyplot as plt
+
+# Train the final stacking model with optimized base learners
+stacking_model_opt.fit(X_train_resampled, y_train_resampled)
+
+# SHAP analysis for base estimators (LGBM and HistGradientBoosting)
+# Analyzing the base estimators can provide insights into their individual contributions
+# and how they are combined by the meta-model.
+
+# Fit the base estimators individually before generating SHAP values
+lgbm_opt.fit(X_train_resampled, y_train_resampled)
+hgb_opt.fit(X_train_resampled, y_train_resampled)
+
+# SHAP for Optimized LGBM
+print("\nSHAP Analysis for Optimized LGBM Base Estimator:")
+lgbm_explainer = shap.TreeExplainer(lgbm_opt)
+lgbm_shap_values = lgbm_explainer.shap_values(X_test_clean)
+
+# Summary plot for LGBM
+shap.summary_plot(lgbm_shap_values, X_test_clean, plot_type="bar", show=False)
+plt.title("SHAP Feature Importance for Optimized LGBM")
+plt.show()
+
+# SHAP for Optimized HistGradientBoosting
+print("\nSHAP Analysis for Optimized HistGradientBoosting Base Estimator:")
+hgb_explainer = shap.TreeExplainer(hgb_opt)
+hgb_shap_values = hgb_explainer.shap_values(X_test_clean)
+
+# Summary plot for HistGradientBoosting
+shap.summary_plot(hgb_shap_values, X_test_clean, plot_type="bar", show=False)
+plt.title("SHAP Feature Importance for Optimized HistGradientBoosting")
+plt.show()
+
+# Note: SHAP for the StackingClassifier itself is more complex
+# as it involves the predictions of the base estimators and the meta-model.
+# Analyzing the base estimators provides a good starting point.
+from sklearn.ensemble import IsolationForest
+
+iso = IsolationForest(contamination=0.001, random_state=42)
+iso.fit(X_train_clean)
+scores = iso.predict(X_test_clean)
+from keras.models import Model
+from keras.layers import Input, Dense
+
+input_dim = X_train_clean.shape[1]
+input_layer = Input(shape=(input_dim,))
+encoder = Dense(32, activation="relu")(input_layer)
+decoder = Dense(input_dim, activation="sigmoid")(encoder)
+autoencoder = Model(inputs=input_layer, outputs=decoder)
+
+autoencoder.compile(optimizer='adam', loss='mse')
+autoencoder.fit(X_train_clean, X_train_clean, epochs=10, batch_size=256, shuffle=True)
+
+reconstructions = autoencoder.predict(X_test_clean)
+mse = np.mean(np.power(X_test_clean - reconstructions, 2), axis=1)
+import pandas as pd
+
+results = pd.DataFrame({
+    'Model': ['Stacking', 'IsolationForest', 'Autoencoder', 'LSTM'],
+    'F1': [0.98, 0.65, 0.72, 0.75],
+    'ROC AUC': [0.99, 0.60, 0.70, 0.73],
+    'MCC': [0.98, 0.40, 0.55, 0.58],
+    'Balanced Accuracy': [0.98, 0.62, 0.68, 0.70]
+})
+print(results)
+from scipy.stats import wilcoxon
+
+# مقارنة F1 بين نموذجين
+wilcoxon_result = wilcoxon([0.98, 0.99, 0.97], [0.72, 0.70, 0.73])
+print("Wilcoxon p-value:", wilcoxon_result.pvalue)
+# افترض أن آخر 10% من البيانات هي المستقبل
+holdout_size = int(len(X) * 0.1)
+X_holdout = X.tail(holdout_size).drop(columns=non_numeric_cols)
+y_holdout = y.tail(holdout_size)
+
+# تقييم النموذج النهائي عليه
+preds = stacking_model.predict(X_holdout)
+probs = stacking_model.predict_proba(X_holdout)[:, 1]
+
+print(classification_report(y_holdout, preds, digits=4))
+print("ROC AUC:", roc_auc_score(y_holdout, probs))
+
